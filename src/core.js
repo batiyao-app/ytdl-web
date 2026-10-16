@@ -1,4 +1,14 @@
-/** Browser-only, direct-stream YouTube extractor. No proxy or executable player scripts. */
+import {muxMP4} from './mux.js';
+/** Public, anonymous YouTube extraction. No proxy or executable player scripts. */
+export const MAX_MEDIA_BYTES=50*1024*1024;
+export function playerRequest(html,id){
+  // This is anonymous context issued with the public watch page, never an account cookie.
+  const match=html.match(/"VISITOR_DATA"\s*:\s*("(?:[^"\\]|\\.)*")/);
+  const visitor=match?JSON.parse(match[1]):undefined;
+  if(!visitor)throw Error('YouTube did not provide anonymous visitor context. Try again later.');
+  return {headers:{'Content-Type':'application/json','X-YouTube-Client-Name':'101','X-YouTube-Client-Version':'1.02','X-Goog-Visitor-Id':visitor},
+    body:JSON.stringify({context:{client:{clientName:'VISIONOS',clientVersion:'1.02',deviceMake:'Apple',deviceModel:'RealityDevice17,1',osName:'visionOS',osVersion:'26.5.23O471',hl:'en',timeZone:'UTC',utcOffsetMinutes:0}},videoId:id,playbackContext:{contentPlaybackContext:{html5Preference:'HTML5_PREF_WANTS'}},contentCheckOk:true,racyCheckOk:true})};
+}
 export function parseInput(value) {
   const u=new URL(value.trim());
   if(u.protocol!=='https:'||u.username||u.password||u.port)throw Error('Use an HTTPS YouTube URL.');
@@ -32,9 +42,18 @@ export function selectStream(data,kind){
   if(data.videoDetails?.isLiveContent)throw Error('Live content is not supported in phase 1.');
   const streams=[...(data.streamingData?.formats||[]),...(data.streamingData?.adaptiveFormats||[])];
   const candidates=streams.filter(f=>f.url&&allowedHost(f.url)&&!f.drmFamilies?.length&&(kind==='mp4'?f.mimeType?.startsWith('video/mp4')&&!!f.audioQuality:f.mimeType?.startsWith('audio/')));
-  candidates.sort((a,b)=>(kind==='mp4'?(b.height||0)-(a.height||0):(b.bitrate||0)-(a.bitrate||0)));
-  if(!candidates.length)throw Error(kind==='mp4'?'No direct MP4 with picture and sound is available. Separate-track merging and ciphered streams are not supported in this build.':'No direct audio stream is available. This source requires extraction features not supported in this build.');
+  candidates.sort((a,b)=>(kind==='mp4'?(b.height||0)-(a.height||0):Number(b.mimeType.startsWith('audio/mp4'))-Number(a.mimeType.startsWith('audio/mp4'))||(b.bitrate||0)-(a.bitrate||0)));
+  if(!candidates.length)throw Error(kind==='mp4'?'No progressive MP4 with picture and sound is available.':'No direct audio stream is available. This source requires extraction features not supported in this build.');
   return candidates[0];
+}
+export function selectTrackPair(data){
+  if(data.playabilityStatus?.status!=='OK')throw Object.assign(Error(data.playabilityStatus?.reason||'This media is unavailable.'),{code:data.playabilityStatus?.status});
+  const streams=(data.streamingData?.adaptiveFormats||[]).filter(f=>f.url&&allowedHost(f.url)&&!f.drmFamilies?.length&&Number(f.contentLength)>0);
+  const audio=streams.filter(f=>f.mimeType?.startsWith('audio/mp4')&&f.mimeType.includes('mp4a.40.2')).sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0];
+  const video=streams.filter(f=>audio&&f.mimeType?.startsWith('video/mp4')&&f.mimeType.includes('avc1')&&Number(f.contentLength)+Number(audio.contentLength)+1048576<MAX_MEDIA_BYTES)
+    .sort((a,b)=>Number((b.height||0)<=720)-Number((a.height||0)<=720)||(b.height||0)-(a.height||0))[0];
+  if(!audio||!video)throw Error('No compatible MP4 with picture and sound fits the 50 MiB device limit. Try a shorter video.');
+  return {video,audio};
 }
 export class Downloader {
   constructor({fetcher=globalThis.fetch,onProgress=()=>{}}={}){this.fetcher=fetcher;this.onProgress=onProgress;}
@@ -46,13 +65,18 @@ export class Downloader {
   async *playlist(input,signal){
     if(!input.playlist){yield {id:input.id,title:input.id};return;}
     const radio=input.radio;
-    const pageURL=radio?'https://www.youtube.com/watch?v='+encodeURIComponent(input.id||input.playlist.slice(2))+'&list='+encodeURIComponent(input.playlist)+'&start_radio=1':'https://www.youtube.com/playlist?list='+encodeURIComponent(input.playlist);
-    const html=await(await this.request(pageURL,{signal})).text();
-    const initial=readJSON(html,'ytInitialData');
+    let initial,version='2.20260708.05.00';
+    if(radio){
+      const html=await(await this.request('https://www.youtube.com/watch?v='+encodeURIComponent(input.id||input.playlist.slice(2))+'&list='+encodeURIComponent(input.playlist)+'&start_radio=1',{signal})).text();
+      initial=readJSON(html,'ytInitialData');version=html.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/)?.[1]||version;
+    }else{
+      // Public playlist metadata does not need a cookie-consent page or account session.
+      const response=await this.request('https://www.youtube.com/youtubei/v1/browse?prettyPrint=false',{method:'POST',signal,headers:{'Content-Type':'application/json','X-YouTube-Client-Name':'1','X-YouTube-Client-Version':version},body:JSON.stringify({context:{client:{clientName:'WEB',clientVersion:version,hl:'en',timeZone:'UTC',utcOffsetMinutes:0}},browseId:'VL'+input.playlist})});
+      initial=await response.json();
+    }
     const root=radio?initial.contents?.twoColumnWatchNextResults?.playlist?.playlist:initial;
     if(radio&&!root)throw Error('YouTube did not return a public radio queue for this link.');
     let page=playlistPage(root);const seen=new Set();let count=0;
-    const version=html.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/)?.[1];
     for(let index=0;index<100;index++){
       for(const item of page.items){signal?.throwIfAborted();if(!seen.has(item.id)){seen.add(item.id);yield item;if(++count>=500)throw Error('Reached the 500-item safety limit.');}}
       if(!page.continuation){if(!count)throw Error('Playlist is empty, private, or not exposed by YouTube. OAuth is not enabled in phase 1.');return;}
@@ -65,19 +89,37 @@ export class Downloader {
   async media(id,kind,signal){
     const html=await(await this.request('https://www.youtube.com/watch?v='+id,{signal})).text();
     let data=readJSON(html,'ytInitialPlayerResponse'),stream;
-    if(data.playabilityStatus?.status!=='OK')throw Object.assign(Error(data.playabilityStatus?.reason||'This media requires sign-in.'),{code:data.playabilityStatus?.status});
+    let pair;
     try{stream=selectStream(data,kind);}catch{
-      const response=await this.request('https://www.youtube.com/youtubei/v1/player?prettyPrint=false',{method:'POST',signal,headers:{'Content-Type':'application/json'},body:JSON.stringify({context:{client:{clientName:'ANDROID_VR',clientVersion:'1.65.10',deviceMake:'Oculus',deviceModel:'Quest 3',androidSdkVersion:32,osName:'Android',osVersion:'12L',hl:'en'}},videoId:id})});
-      data=await response.json();stream=selectStream(data,kind);
+      const response=await this.request('https://www.youtube.com/youtubei/v1/player?prettyPrint=false',{method:'POST',signal,...playerRequest(html,id)});
+      data=await response.json();
+      try{stream=selectStream(data,kind);}catch(e){if(kind!=='mp4'||data.playabilityStatus?.status!=='OK')throw e;pair=selectTrackPair(data);}
     }
     if(kind==='mp3'&&Number(data.videoDetails?.lengthSeconds||0)>600)throw Error('MP3 conversion is limited to ten minutes to protect phone memory.');
-    const response=await this.request(stream.url,{signal});
-    const max=50*1024*1024,total=Number(response.headers.get('content-length')||stream.contentLength||0);
-    if(total>max){await response.body?.cancel();throw Error('This file exceeds the 50 MiB on-device limit.');}
+    const blob=pair?await muxMP4(await this.download(pair.video,signal),await this.download(pair.audio,signal),{signal}):await this.download(stream,signal);
+    return {id,title:data.videoDetails?.title||id,blob,duration:Number(data.videoDetails?.lengthSeconds||0)};
+  }
+  async download(stream,signal){
+    const total=Number(stream.contentLength||0),max=MAX_MEDIA_BYTES;
+    if(total>max)throw Error('This file exceeds the 50 MiB on-device limit.');
+    // Explicit bounded ranges prevent YouTube from throttling whole-file responses.
+    if(total){
+      const chunks=[];let loaded=0;
+      while(loaded<total){
+        signal?.throwIfAborted();const end=Math.min(total-1,loaded+4*1024*1024-1),url=new URL(stream.url);url.searchParams.set('range',loaded+'-'+end);
+        const response=await this.request(url.href,{signal}),bytes=await response.arrayBuffer();
+        if(bytes.byteLength!==end-loaded+1)throw Error('YouTube returned an incomplete media range. Please retry.');
+        chunks.push(bytes);loaded+=bytes.byteLength;this.onProgress({loaded,total});
+      }
+      return new Blob(chunks,{type:stream.mimeType.split(';')[0]});
+    }
+    const response=await this.request(stream.url,{signal}),declared=Number(response.headers.get('content-length')||0);
+    if(declared>max){await response.body?.cancel();throw Error('This file exceeds the 50 MiB on-device limit.');}
     const reader=response.body.getReader(),chunks=[];let loaded=0;
     try{for(;;){signal?.throwIfAborted();const {done,value}=await reader.read();if(done)break;loaded+=value.length;if(loaded>max)throw Error('File exceeded the 50 MiB limit.');chunks.push(value);this.onProgress({loaded,total});}}
     catch(e){await reader.cancel().catch(()=>{});throw e;}finally{reader.releaseLock();}
     if(!loaded)throw Error('The source returned an empty file.');
-    return {id,title:data.videoDetails?.title||id,blob:new Blob(chunks,{type:stream.mimeType.split(';')[0]}),duration:Number(data.videoDetails?.lengthSeconds||0)};
+    if(declared&&declared!==loaded)throw Error('YouTube returned an incomplete media file. Please retry.');
+    return new Blob(chunks,{type:stream.mimeType.split(';')[0]});
   }
 }
