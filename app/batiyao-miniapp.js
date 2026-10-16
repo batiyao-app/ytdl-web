@@ -34,12 +34,31 @@
  *   from an opaque origin (Origin: null) with no cookies, so your server
  *   answers with CORS (Access-Control-Allow-Origin: *) and authenticates with
  *   what your app sends.
+ * 1.8.0 (2026-10-16): net.fetch — read your approved addresses even when
+ *   they send no CORS headers (a media source, a feed). The Batiyao phone app
+ *   makes the request on the phone itself, only to your approved addresses,
+ *   with no cookies and nothing of the person's. Phone apps only: on
+ *   batiyao.com supports('net') is false and calls reject UNKNOWN_METHOD (a
+ *   browser can't get around CORS). An admin switches it on per app: declare
+ *   "net.fetch" in manifest.json "capabilities" with your purpose and have
+ *   permission from each source. Answers { status, status_text, url,
+ *   headers } and text / json / blob / file; net.cancel(requestId) stops one.
+ * 1.7.0 (2026-10-16): share({ invite: true }) — while the person is in a
+ *   match, the post or chat message links into it (…/apps/<slug>?join=CODE),
+ *   so whoever taps it joins. Batiyao finds the code; stories can't invite.
+ * 1.6.0 (2026-10-16): files and media sharing. Batiyao.files keeps your
+ *   app's own pictures, sounds and videos on this device (save, get, list,
+ *   remove, usage): one space per person and app, 200 MB, never uploaded.
+ *   share() also takes a video ({ video: Blob }, up to 20 MB and 60 s) or a
+ *   sound ({ audio: Blob }, up to 10 MB and 5 minutes, optionally with an
+ *   image to show it with). Batiyao re-encodes either before the person
+ *   sees it. Check supports('files') and supports('shareMedia').
  */
 (function (global) {
   'use strict';
 
   var PROTOCOL = 1;
-  var VERSION = '1.5.0';
+  var VERSION = '1.8.0';
   var pending = Object.create(null);
   var listeners = Object.create(null);
   var counter = 0;
@@ -53,6 +72,8 @@
 
   // Progress callbacks of running ai requests, by request id.
   var progress = Object.create(null);
+  // net.fetch progress callbacks, by the request_id the SDK gave it.
+  var netProgress = Object.create(null);
 
   function send(method, params, timeoutMs, onProgress) {
     return new Promise(function (resolve, reject) {
@@ -93,6 +114,13 @@
       }
       return;
     }
+    if (data.event === 'net.progress' && data.data && typeof data.data.request_id === 'string') {
+      var nf = netProgress[data.data.request_id];
+      if (nf) {
+        try { nf({ received: data.data.received, total: data.data.total == null ? null : data.data.total }); } catch (e) { /* the app's own error */ }
+      }
+      return;
+    }
     if (typeof data.event === 'string') {
       var fns = listeners[data.event] || [];
       for (var i = 0; i < fns.length; i++) {
@@ -114,7 +142,7 @@
     'getPurchases', 'consume', 'close', 'on', 'off', 'supports'];
   var LEGACY_FEATURES = ['pay', 'share'];
   // Method names that belong to one listed feature.
-  var FEATURE_OF = { getNickname: 'nickname', 'multiplayer.invite': 'invite', 'ai.image.generate': 'ai.image', 'ai.audio.generate': 'ai.audio', 'ai.ask': 'ai.assistant' };
+  var FEATURE_OF = { 'net.fetch': 'net', 'net.cancel': 'net', 'share.video': 'shareMedia', 'share.audio': 'shareMedia', getNickname: 'nickname', 'multiplayer.invite': 'invite', 'ai.image.generate': 'ai.image', 'ai.audio.generate': 'ai.audio', 'ai.ask': 'ai.assistant' };
   var AI_CAPABILITIES = ['ai.image', 'ai.audio', 'ai.assistant'];
   var IMAGE_QUALITY = ['fast', 'balanced', 'best'];
   var AUDIO_SECONDS = { music: [8, 15, 30], sound: [3, 6, 12] };
@@ -172,6 +200,94 @@
     return v !== null && typeof v === 'object' && !Array.isArray(v);
   }
 
+  // Batiyao.files: plain names, and at most 50 MB a file (the host checks
+  // the rest: the type from the bytes, 200 MB and 500 files per app).
+  var FILE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+  var FILE_MAX_BYTES = 50 * 1024 * 1024;
+  var SHARE_VIDEO_MAX_BYTES = 20 * 1024 * 1024;
+  var SHARE_AUDIO_MAX_BYTES = 10 * 1024 * 1024;
+
+  function isBlob(v) {
+    return typeof Blob !== 'undefined' && v instanceof Blob;
+  }
+
+  // A call that needs a feature an older Batiyao doesn't have: answered
+  // UNKNOWN_METHOD here rather than sent to a host that would mishandle it.
+  function withFeature(feature, method, run) {
+    return context().then(function (ctx) {
+      var f = ctx && ctx.features;
+      if (!Array.isArray(f) || f.indexOf(feature) < 0) {
+        throw makeError('UNKNOWN_METHOD', 'This version of Batiyao doesn\'t have ' + method + '(). Check supports(\'' + feature + '\') first.');
+      }
+      return run();
+    });
+  }
+
+  function checkFileName(name) {
+    if (typeof name !== 'string' || !FILE_NAME_RE.test(name)) {
+      return makeError('INVALID_NAME', 'A file name is 1-128 letters, digits, "_", "." or "-", not starting with "." or "-".');
+    }
+    return null;
+  }
+
+  // net.fetch (1.8.0): what Batiyao accepts, checked here first.
+  var NET_METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'];
+  var NET_RESPONSES = ['text', 'json', 'blob', 'file'];
+  var NET_FORBIDDEN = ['host', 'cookie', 'origin', 'referer', 'user-agent', 'connection', 'content-length',
+    'transfer-encoding', 'accept-encoding', 'expect', 'via', 'forwarded', 'date', 'dnt', 'te', 'trailer', 'upgrade', 'keep-alive'];
+  var NET_BODY_MAX = 20 * 1024 * 1024;
+  var NET_ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+  var netCounter = 0;
+
+  function netHeaderForbidden(name) {
+    var n = String(name).trim().toLowerCase();
+    return NET_FORBIDDEN.indexOf(n) >= 0 || /^(proxy-|sec-|x-forwarded-)/.test(n);
+  }
+
+  // checkNetFetch returns the params to send, or throws the error.
+  function checkNetFetch(url, o) {
+    if (typeof url !== 'string' || url.length > 2048 || !/^https:\/\/[^\s/?#]+/i.test(url)) {
+      throw makeError('INVALID', 'net.fetch() takes an https:// address on one of your approved addresses.');
+    }
+    var params = { url: url };
+    var method = o.method == null ? 'GET' : String(o.method).toUpperCase();
+    if (NET_METHODS.indexOf(method) < 0) throw makeError('INVALID', 'method is GET, HEAD, POST, PUT, PATCH or DELETE.');
+    params.method = method;
+    if (o.headers != null) {
+      if (!isPlainObject(o.headers)) throw makeError('INVALID', 'headers is an object of strings.');
+      var names = Object.keys(o.headers);
+      if (names.length > 32) throw makeError('INVALID', 'At most 32 headers.');
+      for (var i = 0; i < names.length; i++) {
+        var v = o.headers[names[i]];
+        if (netHeaderForbidden(names[i])) throw makeError('NET_HEADER_FORBIDDEN', 'Batiyao sets or refuses the header ' + names[i] + '.');
+        if (!names[i] || typeof v !== 'string' || v.length > 8192 || /[\r\n]/.test(names[i] + v)) {
+          throw makeError('INVALID', 'Header values are text of at most 8 KB, with no line breaks.');
+        }
+      }
+      params.headers = o.headers;
+    }
+    if (o.body != null) {
+      if (method === 'GET' || method === 'HEAD') throw makeError('INVALID', 'GET and HEAD take no body.');
+      if (typeof o.body !== 'string' && !isBlob(o.body)) throw makeError('INVALID', 'body is text or a Blob.');
+      var size = typeof o.body === 'string' ? utf8Bytes(o.body) : o.body.size;
+      if (size > NET_BODY_MAX) throw makeError('NET_TOO_LARGE', 'A body is at most 20 MB.');
+      params.body = o.body;
+    }
+    var response = o.response == null ? 'text' : o.response;
+    if (NET_RESPONSES.indexOf(response) < 0) throw makeError('INVALID', 'response is text, json, blob or file.');
+    params.response = response;
+    if (response === 'file') {
+      var e = checkFileName(o.name);
+      if (e) throw e;
+      params.name = o.name;
+    }
+    if (o.timeout_ms != null) {
+      if (!isWhole(o.timeout_ms) || o.timeout_ms < 1000 || o.timeout_ms > 600000) throw makeError('INVALID', 'timeout_ms is 1000 to 600000.');
+      params.timeout_ms = o.timeout_ms;
+    }
+    return params;
+  }
+
   var CODE_RE = /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}$/;
   var MP_EVENTS = ['joined', 'left', 'message', 'host', 'closed'];
 
@@ -218,11 +334,15 @@
     },
 
     /**
-     * Offer the person something to share as a post or story: a picture your
-     * app made (a <canvas> or a PNG/JPEG data: URL, up to 6 MB, 64-4096 px a
-     * side) and suggested words (up to 380 characters; no @tags, #hashtags
-     * or links). Batiyao shows its own sheet; the person picks Story or Post,
-     * may change the words, and decides. Call it from a tap.
+     * Offer the person something to share as a post, story or chat message:
+     * a picture your app made (a <canvas> or a PNG/JPEG data: URL, up to
+     * 6 MB, 64-4096 px a side), a video ({ video: Blob }, up to 20 MB and 60
+     * seconds) or a sound ({ audio: Blob }, up to 10 MB and 5 minutes; with
+     * image, the picture it is shown with in a post or story), and suggested
+     * words (up to 380 characters; no @tags, #hashtags or links). Batiyao
+     * re-encodes a video or sound first, shows its own sheet, and the person
+     * decides. Call it from a tap. Videos and sounds need
+     * supports('shareMedia'); an older Batiyao rejects UNKNOWN_METHOD.
      * Resolves {} when the sheet closes. On purpose, your app is never told
      * whether the person shared: never reward sharing or require it.
      */
@@ -241,10 +361,38 @@
       if (typeof text !== 'string' || text.length > 380) {
         return Promise.reject(makeError('INVALID', 'share() text is a string of at most 380 characters.'));
       }
-      if (!image && !text) {
-        return Promise.reject(makeError('INVALID', 'share() needs an image, text, or both.'));
+      var video = options.video, audio = options.audio;
+      if ((video != null && !isBlob(video)) || (audio != null && !isBlob(audio))) {
+        return Promise.reject(makeError('INVALID', 'share() takes a video or a sound as a Blob.'));
       }
-      return send('share', { image: image || '', text: text });
+      if ((video && audio) || (video && image)) {
+        return Promise.reject(makeError('INVALID', 'share() takes one picture, video or sound (a sound may come with a picture).'));
+      }
+      if (video && video.size > SHARE_VIDEO_MAX_BYTES) {
+        return Promise.reject(makeError('VIDEO_TOO_LARGE', 'A video to share is at most 20 MB.'));
+      }
+      if (audio && audio.size > SHARE_AUDIO_MAX_BYTES) {
+        return Promise.reject(makeError('AUDIO_TOO_LARGE', 'A sound to share is at most 10 MB.'));
+      }
+      if (options.invite != null && typeof options.invite !== 'boolean') {
+        return Promise.reject(makeError('INVALID', 'share() invite is true or false.'));
+      }
+      var invite = options.invite === true;
+      if (!image && !text && !video && !audio && !invite) {
+        return Promise.reject(makeError('INVALID', 'share() needs a picture, a video, a sound, text, or a mix.'));
+      }
+      var params = { image: image || '', text: text };
+      if (video) params.video = video;
+      if (audio) params.audio = audio;
+      if (invite) params.invite = true;
+      var go = function () { return send('share', params); };
+      // A Batiyao without these would share without them: refuse instead.
+      if (invite && (video || audio)) {
+        return withFeature('shareInvite', 'share', function () { return withFeature('shareMedia', 'share', go); });
+      }
+      if (invite) return withFeature('shareInvite', 'share', go);
+      if (video || audio) return withFeature('shareMedia', 'share', go);
+      return go();
     },
 
     /**
@@ -305,7 +453,7 @@
       if (CORE.indexOf(name) >= 0) return Promise.resolve(isFramed);
       if (typeof name === 'string') {
         if (FEATURE_OF[name]) name = FEATURE_OF[name];
-        else if (/^(db|multiplayer)\./.test(name)) name = name.split('.')[0];
+        else if (/^(db|multiplayer|files)\./.test(name)) name = name.split('.')[0];
       }
       return context().then(function (ctx) {
         var f = ctx && ctx.features;
@@ -552,6 +700,99 @@
       /** How full the store is: { bytes, limit }. */
       usage: function () {
         return send('db.usage', {}, 20000);
+      }
+    },
+
+    /**
+     * Your app's own pictures, sounds and videos, kept on this device by
+     * Batiyao (your app has no storage of its own): one space per person and
+     * app (test runs apart), 200 MB and 500 files, 50 MB a file, never
+     * uploaded and not on the person's other devices. Only PNG, JPEG, GIF,
+     * WebP, WAV, MP3, M4A, Ogg, WebM and MP4 are kept; the type comes from the
+     * bytes. Check supports('files'): an older Batiyao rejects UNKNOWN_METHOD.
+     * The person can clear them from your app's page. Share one with share().
+     */
+    files: {
+      /** Keep a Blob under a name (the same name replaces). Resolves { saved: true, name, type, kind, size, saved_at }. */
+      save: function (name, file) {
+        var e = checkFileName(name);
+        if (e) return Promise.reject(e);
+        if (!isBlob(file) || file.size === 0) return Promise.reject(makeError('INVALID', 'files.save() needs a non-empty Blob.'));
+        if (file.size > FILE_MAX_BYTES) return Promise.reject(makeError('FILE_TOO_LARGE', 'A file is at most 50 MB.'));
+        return send('files.save', { name: name, file: file }, 120000);
+      },
+      /** Resolves { file: Blob, name, type, kind, size, saved_at }, or { file: null } when there's no such file. */
+      get: function (name) {
+        var e = checkFileName(name);
+        if (e) return Promise.reject(e);
+        return send('files.get', { name: name }, 60000);
+      },
+      /** Resolves an array of { name, type, kind, size, saved_at }, by name. */
+      list: function () {
+        return send('files.list', {}, 20000).then(function (r) { return r ? r.files : []; });
+      },
+      /** Resolves { removed: true } (also when there was no such file). */
+      remove: function (name) {
+        var e = checkFileName(name);
+        if (e) return Promise.reject(e);
+        return send('files.remove', { name: name }, 20000);
+      },
+      /** Resolves { bytes, limit, count, max_files }. */
+      usage: function () {
+        return send('files.usage', {}, 20000);
+      }
+    },
+
+    /**
+     * Read your approved addresses (manifest.json "network") even when they
+     * send no CORS headers. The Batiyao phone app makes the request on the
+     * phone itself — only to your approved addresses (every redirect
+     * re-checked), never to the phone or its local network, with no cookies
+     * and nothing of the person's, and a User-Agent of its own. Phone apps
+     * only: on batiyao.com supports('net') is false and calls reject
+     * UNKNOWN_METHOD. An admin switches it on for your app (declare
+     * "net.fetch" in "capabilities" and have each source's permission);
+     * check supports('net'). Limits: 4 at once, 120 a minute, 500 MB a run,
+     * 10 MB of text or JSON, 50 MB a blob or file, a 20 MB body.
+     */
+    net: {
+      /**
+       * fetch(url, { method, headers, body, response: 'text' | 'json' |
+       * 'blob' | 'file', name, timeout_ms, onProgress }). Resolves
+       * { status, status_text, url, headers } with text, json,
+       * { blob, type, size } or { file: { name, type, kind, size, saved_at } }
+       * ('file' keeps it with Batiyao.files under name). A 4xx or 5xx is an
+       * answer, not an error. The promise carries .requestId for cancel().
+       */
+      fetch: function (url, options) {
+        var o = options || {};
+        netCounter += 1;
+        var rid = 'n' + netCounter + '-' + Date.now().toString(36);
+        var p;
+        try {
+          var params = checkNetFetch(url, o);
+          if (o.request_id != null) {
+            if (typeof o.request_id !== 'string' || !NET_ID_RE.test(o.request_id)) throw makeError('INVALID', 'request_id is 1-64 letters, digits, "_", ".", ":" or "-".');
+            rid = o.request_id;
+          }
+          params.request_id = rid;
+          var long = params.response === 'blob' || params.response === 'file';
+          var wait = (params.timeout_ms || (long ? 600000 : 60000)) + 30000;
+          p = withFeature('net', 'net.fetch', function () {
+            if (typeof o.onProgress === 'function') netProgress[rid] = o.onProgress;
+            var done = function () { delete netProgress[rid]; };
+            return send('net.fetch', params, wait).then(function (r) { done(); return r; }, function (e) { done(); throw e; });
+          });
+        } catch (e) {
+          p = Promise.reject(e);
+        }
+        p.requestId = rid;
+        return p;
+      },
+      /** Stop a running fetch (the promise rejects NET_CANCELLED). Resolves {}. */
+      cancel: function (requestId) {
+        if (typeof requestId !== 'string' || !NET_ID_RE.test(requestId)) return Promise.reject(makeError('INVALID', 'cancel() takes a request id.'));
+        return withFeature('net', 'net.cancel', function () { return send('net.cancel', { request_id: requestId }, 20000); });
       }
     },
 

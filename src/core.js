@@ -28,7 +28,7 @@ export function playlistPage(data){
   walk(data);return {items,continuation:tokens.at(-1)};
 }
 export function selectStream(data,kind){
-  if(data.playabilityStatus?.status!=='OK')throw Error(data.playabilityStatus?.reason||'This media is not available without sign-in.');
+  if(data.playabilityStatus?.status!=='OK')throw Object.assign(Error(data.playabilityStatus?.reason||'This media is not available without sign-in.'),{code:data.playabilityStatus?.status});
   if(data.videoDetails?.isLiveContent)throw Error('Live content is not supported in phase 1.');
   const streams=[...(data.streamingData?.formats||[]),...(data.streamingData?.adaptiveFormats||[])];
   const candidates=streams.filter(f=>f.url&&allowedHost(f.url)&&!f.drmFamilies?.length&&(kind==='mp4'?f.mimeType?.startsWith('video/mp4')&&!!f.audioQuality:f.mimeType?.startsWith('audio/')));
@@ -65,17 +65,17 @@ export class Downloader {
   async media(id,kind,signal){
     const html=await(await this.request('https://www.youtube.com/watch?v='+id,{signal})).text();
     let data=readJSON(html,'ytInitialPlayerResponse'),stream;
-    if(data.playabilityStatus?.status!=='OK')throw Error(data.playabilityStatus?.reason||'This media requires sign-in.');
+    if(data.playabilityStatus?.status!=='OK')throw Object.assign(Error(data.playabilityStatus?.reason||'This media requires sign-in.'),{code:data.playabilityStatus?.status});
     try{stream=selectStream(data,kind);}catch{
       const response=await this.request('https://www.youtube.com/youtubei/v1/player?prettyPrint=false',{method:'POST',signal,headers:{'Content-Type':'application/json'},body:JSON.stringify({context:{client:{clientName:'ANDROID_VR',clientVersion:'1.65.10',deviceMake:'Oculus',deviceModel:'Quest 3',androidSdkVersion:32,osName:'Android',osVersion:'12L',hl:'en'}},videoId:id})});
       data=await response.json();stream=selectStream(data,kind);
     }
     if(kind==='mp3'&&Number(data.videoDetails?.lengthSeconds||0)>600)throw Error('MP3 conversion is limited to ten minutes to protect phone memory.');
     const response=await this.request(stream.url,{signal});
-    const max=64*1024*1024,total=Number(response.headers.get('content-length')||stream.contentLength||0);
-    if(total>max){await response.body?.cancel();throw Error('This file exceeds the 64 MiB on-device limit.');}
+    const max=50*1024*1024,total=Number(response.headers.get('content-length')||stream.contentLength||0);
+    if(total>max){await response.body?.cancel();throw Error('This file exceeds the 50 MiB on-device limit.');}
     const reader=response.body.getReader(),chunks=[];let loaded=0;
-    try{for(;;){signal?.throwIfAborted();const {done,value}=await reader.read();if(done)break;loaded+=value.length;if(loaded>max)throw Error('File exceeded the 64 MiB limit.');chunks.push(value);this.onProgress({loaded,total});}}
+    try{for(;;){signal?.throwIfAborted();const {done,value}=await reader.read();if(done)break;loaded+=value.length;if(loaded>max)throw Error('File exceeded the 50 MiB limit.');chunks.push(value);this.onProgress({loaded,total});}}
     catch(e){await reader.cancel().catch(()=>{});throw e;}finally{reader.releaseLock();}
     if(!loaded)throw Error('The source returned an empty file.');
     return {id,title:data.videoDetails?.title||id,blob:new Blob(chunks,{type:stream.mimeType.split(';')[0]}),duration:Number(data.videoDetails?.lengthSeconds||0)};
