@@ -1,0 +1,4 @@
+// Static asset preview only. No download API, proxy, Python or yt-dlp service.
+import http from 'node:http';import fs from 'node:fs/promises';import path from 'node:path';
+const root=path.resolve('app');
+http.createServer(async(req,res)=>{try{const route=decodeURIComponent(new URL(req.url,'http://localhost').pathname),file=path.resolve(root,'.'+(route==='/'?'/index.html':route));if(!file.startsWith(root+path.sep))throw Error();const data=await fs.readFile(file);res.setHeader('Content-Type',({'.html':'text/html','.js':'text/javascript','.css':'text/css','.png':'image/png'})[path.extname(file)]||'application/octet-stream');res.setHeader('Cache-Control','no-store');res.end(data);}catch{res.writeHead(404);res.end('Not found');}}).listen(8081,'127.0.0.1',()=>console.log('Static JS preview: http://127.0.0.1:8081'));
