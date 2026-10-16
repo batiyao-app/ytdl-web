@@ -78,10 +78,10 @@ Each download is capped at 64 MiB; session library at 128 MiB. MP3 encoding is l
 - Live media fetch hit YouTube bot verification; no successful end-to-end media download is claimed.
 - Ordinary browser and official Batiyao simulator network tests failed with the app's blocked/unavailable-network message.
 
-Sources: https://developer.batiyao.com/miniapps ; https://github.com/batiyao-app/developer-sample . The web documentation still says “no wildcards” while the latest packer accepts the declaration; the deployed platform must be checked separately.
+Sources: https://developer.batiyao.com/miniapps ; https://github.com/batiyao-app/developer-sample . The updated documentation and packer support wildcards. The simulator was updated to commit 0068213 (live manifest network-policy reload) and the public Radio URL was retested: browser fetch still fails. A direct header check with Origin: null returned HTTP 200 but no Access-Control-Allow-Origin header from YouTube, confirming an independent CORS restriction.
 
 ## Licensing
 
-Application source: MIT. The official Batiyao SDK is MIT; its notice is in `app/BATIYAO-LICENSE.txt`. The MP3 encoder `@breezystack/lamejs` 1.2.7 is LGPL-3.0; its license is in `app/LAME-LICENSE.txt`. Dependency versions are locked and the JS bundle can be rebuilt with a replacement encoder. Upstream encoder source: https://github.com/shijinyu/lamejs ; package: https://www.npmjs.com/package/@breezystack/lamejs . Preserve these notices when distributing.
+Application source: MIT. The official Batiyao SDK is MIT; its notice is in `app/BATIYAO-LICENSE.txt`. The MP3 encoder `@breezystack/lamejs` 1.2.7 is LGPL-3.0; its license is in `app/LAME-LICENSE.txt`. Dependency versions are locked and the JS bundle can be rebuilt with a replacement encoder. Upstream encoder source: https://github.com/shijinyu/lamejs ; package: https://www.npmjs.com/package/@breezystack/lamejs . Corresponding encoder source and build configuration are included in third_party/lamejs (upstream version 1.2.7). Full LGPL/GPL texts are included in app/. Preserve these notices when distributing.
 
 Do not commit access tokens, browser cookies, OAuth credentials or media files. The project contains none of those.

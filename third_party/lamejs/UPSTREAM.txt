@@ -1,0 +1,4 @@
+Upstream: https://github.com/shijinyu/lamejs
+Commit: 1fb0ef5fa177413107e2e107d054a9b994e3f79c
+Package version: @breezystack/lamejs 1.2.7
+Source provided unchanged. npm install && npm run build in this folder rebuilds the encoder.
